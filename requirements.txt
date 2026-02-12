@@ -1,2 +1,5 @@
 gradio
-matplotlib
+transformers
+onnxruntime
+numpy
+huggingface_hub

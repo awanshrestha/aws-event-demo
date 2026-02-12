@@ -4,12 +4,23 @@ runtime: python311
 build:
   commands:
     build:
-      - echo "Build stage"
+      - echo "Build stage (nothing to compile)"
 
 run:
   runtime-version: 3.11
   pre-run:
     - pip3 install --no-cache-dir -r requirements.txt
+    - python3 -c "from huggingface_hub import hf_hub_download; repo='Intel/distilbert-base-uncased-finetuned-sst-2-english-int8-dynamic-inc'; [hf_hub_download(repo, f) for f in ['model.onnx','config.json','vocab.txt','tokenizer_config.json']]; print('HF model cached')"
   command: python3 app.py
   network:
     port: 8080
+    env: PORT
+  env:
+    - name: HF_HOME
+      value: "/tmp/hf"
+    - name: TRANSFORMERS_CACHE
+      value: "/tmp/hf/transformers"
+    - name: TOKENIZERS_PARALLELISM
+      value: "false"
+    - name: GRADIO_SERVER_NAME
+      value: "0.0.0.0"

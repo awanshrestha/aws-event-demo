@@ -1,66 +1,118 @@
+import json
+from functools import lru_cache
+
 import gradio as gr
+import numpy as np
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 
-import matplotlib
+MODEL_ID = "Intel/distilbert-base-uncased-finetuned-sst-2-english-int8-dynamic-inc"
+ONNX_FILE = "model.onnx"
 
-# REQUIRED: Use a non-interactive backend for AWS/Server deployment
-# Otherwise it will crash on the cloud!
-matplotlib.use('Agg') 
-import matplotlib.pyplot as plt
 
-def generate_chart(labels_text, values_text, chart_type):
-    try:
-        # 1. Process the Inputs
-        # Split the text by commas and clean up whitespace
-        labels = [l.strip() for l in labels_text.split(',')]
-        values = [float(v.strip()) for v in values_text.split(',')]
+def softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=-1, keepdims=True)
 
-        # Check for errors (mismatched data)
-        if len(labels) != len(values):
-            raise ValueError(f"You have {len(labels)} labels but {len(values)} numbers!")
 
-        # 2. Create the Chart
-        fig = plt.figure(figsize=(8, 6))
-        
-        if chart_type == "Bar Chart":
-            plt.bar(labels, values, color=['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0'])
-            plt.xlabel("Categories")
-            plt.ylabel("Values")
-        elif chart_type == "Pie Chart":
-            plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90, colors=['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0'])
-        elif chart_type == "Line Chart":
-            plt.plot(labels, values, marker='o', linestyle='-', color='#36A2EB')
-            plt.grid(True)
+@lru_cache(maxsize=1)
+def load_assets():
+    """
+    Lazy-load (and cache) tokenizer + ONNX session.
+    This avoids reloading the model on every request.
+    """
+    # Download files into HF cache (works locally + on App Runner)
+    onnx_path = hf_hub_download(repo_id=MODEL_ID, filename=ONNX_FILE)
+    config_path = hf_hub_download(repo_id=MODEL_ID, filename="config.json")
 
-        plt.title(f"My Awesome {chart_type}")
-        
-        # 3. Return the figure object
-        return fig
-        
-    except Exception as e:
-        # If something goes wrong, return a blank figure with the error
-        fig = plt.figure()
-        plt.text(0.5, 0.5, str(e), ha='center', va='center', color='red')
-        return fig
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
 
-# 4. Build the UI
+    # id2label sometimes comes as {"0": "...", "1": "..."}
+    raw = cfg.get("id2label") or {}
+    id2label = {int(k): v for k, v in raw.items()} if raw else {0: "NEGATIVE", 1: "POSITIVE"}
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+
+    # Create ONNX Runtime session (CPU)
+    sess_options = ort.SessionOptions()
+    session = ort.InferenceSession(
+        onnx_path,
+        providers=["CPUExecutionProvider"],
+        sess_options=sess_options,
+    )
+
+    input_names = [i.name for i in session.get_inputs()]
+    return tokenizer, session, input_names, id2label
+
+
+def predict(text: str):
+    text = (text or "").strip()
+    if not text:
+        return {"POSITIVE": 0.0, "NEGATIVE": 0.0}
+
+    tokenizer, session, input_names, id2label = load_assets()
+
+    encoded = tokenizer(
+        text,
+        return_tensors="np",
+        truncation=True,
+        padding=True,
+        max_length=256,
+    )
+
+    # ONNX model expects specific inputs 
+    ort_inputs = {}
+    for name in input_names:
+        if name in encoded:
+            arr = encoded[name]
+            # ensure int64 
+            if arr.dtype != np.int64:
+                arr = arr.astype(np.int64)
+            ort_inputs[name] = arr
+
+    outputs = session.run(None, ort_inputs)
+    logits = outputs[0]  # shape: (batch, num_labels)
+    probs = softmax(logits)[0]
+
+    # Build a label->prob dict for Gradio Label component
+    result = {}
+    for i, p in enumerate(probs.tolist()):
+        label = id2label.get(i, str(i))
+        result[label] = float(p)
+
+    # If labels are like LABEL_0/LABEL_1, normalize to POSITIVE/NEGATIVE (optional)
+    # But SST-2 models typically already use POSITIVE/NEGATIVE in id2label.
+    return result
+
+
 with gr.Blocks() as demo:
-    gr.Markdown("# 📊 The 30-Minute Chart Builder")
-    gr.Markdown("Enter data below to instantly generate a visualization.")
-    
-    with gr.Row():
-        with gr.Column():
-            # Inputs
-            txt_labels = gr.Textbox(label="Categories (comma separated)", placeholder="Rent, Food, Gym, Netflix", value="Rent, Food, Gym, Netflix")
-            txt_values = gr.Textbox(label="Values (comma separated)", placeholder="1000, 400, 50, 20", value="1000, 400, 50, 20")
-            radio_type = gr.Radio(["Bar Chart", "Pie Chart", "Line Chart"], label="Chart Type", value="Bar Chart")
-            btn = gr.Button("Generate Chart 🚀", variant="primary")
-        
-        with gr.Column():
-            # Output
-            plot_output = gr.Plot(label="Your Chart")
+    gr.Markdown("# 🙂/🙁 Sentiment Classifier (Hugging Face ONNX)")
+    gr.Markdown(
+        "Type a sentence and get **positive vs negative** probabilities. "
+        "This uses an **INT8 ONNX** model so it deploys faster than PyTorch Transformers."
+    )
 
-    btn.click(generate_chart, inputs=[txt_labels, txt_values, radio_type], outputs=plot_output)
+    inp = gr.Textbox(
+        label="Your text",
+        placeholder="e.g., I loved this project!",
+        lines=3,
+    )
+    out = gr.Label(num_top_classes=2, label="Prediction")
 
-# 5. Launch 
+    btn = gr.Button("Analyze 🚀", variant="primary")
+    btn.click(predict, inputs=inp, outputs=out)
+
+    gr.Examples(
+        examples=[
+            "This is amazing — I learned a lot!",
+            "I hate this. It never works.",
+            "Pretty decent overall, could be better.",
+        ],
+        inputs=inp,
+    )
+
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=8080)
