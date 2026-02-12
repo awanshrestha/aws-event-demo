@@ -1,10 +1,11 @@
 import gradio as gr
-import matplotlib.pyplot as plt
+
 import matplotlib
 
 # REQUIRED: Use a non-interactive backend for AWS/Server deployment
 # Otherwise it will crash on the cloud!
 matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
 
 def generate_chart(labels_text, values_text, chart_type):
     try:
